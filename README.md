@@ -42,34 +42,41 @@ Uninstall any time:
 ./uninstall.sh
 ```
 
-## How it works (and what to check before you trust it)
+## How it works (and the one network call, explained)
 
-This tool touches your Claude credentials, so please read the ~250 lines of
-`SessionWidget.swift` and `session_usage_poll.py` before running it.
+The widget shows your Claude 5-hour usage window: time left and how much you've
+used. The goal is to match what claude.ai shows, to the minute.
 
-The 5-hour usage window is a **server-side** counter that spans every surface
-(Claude Code, claude.ai web, mobile). Your local Claude Code transcripts only
-see Claude Code, so reconstructing the window from them drifts whenever you also
-use the web/app. The only way to get the exact number is to read Anthropic's
-rate-limit headers — and those only come back on a real API call. So:
+The catch: that 5-hour limit lives on Anthropic's servers and counts everything
+(Claude Code, the web app, mobile). Your Mac can't see your web/app usage, so
+guessing the number from local files drifts by up to an hour or two. The only
+way to get the real figure is to read it from Anthropic directly.
 
-- **`session_usage_poll.py`** (a launch agent, every 10 minutes):
-  - Reads your existing **Claude Code OAuth token** from the login keychain
-    (the `Claude Code-credentials` item that Claude Code itself created — the
-    first run may pop a one-time keychain "allow" prompt).
-  - Makes **one tiny 1-token `/v1/messages` call** and reads the
-    `anthropic-ratelimit-unified-*` response headers.
-  - Writes them to `~/.claude/session-usage.json`. That's it.
-  - It **only calls when you've used Claude Code in the last ~12 minutes**, so
-    an idle Mac never pings (a call after the window expired would itself *open*
-    a new window). It clears `ANTHROPIC_API_KEY` so the call always bills to
-    your subscription, never pay-as-you-go API credits. Cost is negligible.
-- **`SessionWidget.swift`** just reads `~/.claude/session-usage.json` and draws
-  the card. With `--widget-only` (no poller) it instead estimates the window by
-  chaining 5-hour blocks across your transcript timestamps and labels it `est`.
+So here's the deal:
 
-Nothing is sent anywhere except that one call to `api.anthropic.com` with your
-own token. No telemetry, no third-party servers, no analytics.
+- A small script runs every 10 minutes in the background.
+- It grabs your existing Claude Code login token (the one Claude Code already
+  saved in your Mac keychain) and makes **one tiny API call** to Anthropic.
+  (macOS may show a one-time keychain "allow" prompt the first time.)
+- That call sends a single word and asks for 1 token back. Its only purpose is
+  to read the "usage limits" info Anthropic attaches to every reply. The reply
+  is effectively free and bills to your Claude subscription, not pay-as-you-go
+  API credits.
+- It saves those numbers to a file on your Mac (`~/.claude/session-usage.json`).
+  The widget just reads that file and draws the card.
+
+What it does **not** do:
+
+- It only calls when you've actually used Claude Code in the last ~12 minutes,
+  so an idle Mac never pings.
+- Nothing goes anywhere except that one call to `api.anthropic.com`, using your
+  own token. No third-party servers, no analytics, no tracking.
+- It's all here, about 250 lines across `SessionWidget.swift` and
+  `session_usage_poll.py`. Please read it before you run it.
+
+Don't want any network calls? Install with `./install.sh --widget-only` and it
+estimates the window from your local Claude Code logs instead (less precise,
+flagged `est`, zero calls).
 
 ## Files
 
