@@ -1,0 +1,5 @@
+SessionWidget.app/
+*.app
+.DS_Store
+*.log
+build/
