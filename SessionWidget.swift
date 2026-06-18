@@ -1,13 +1,14 @@
-// SessionWidget — a tiny floating desktop widget that shows your current
-// Claude Code 5-hour usage window, a live "resets in" countdown, and % used.
+// SessionWidget — a tiny floating desktop widget that shows the current
+// Claude Code 5-hour usage window and a live "resets in" countdown.
 //
-// It reads the exact numbers from ~/.claude/session-usage.json (written by the
-// companion poller, session_usage_poll.py, which reads Anthropic's rate-limit
-// headers — so they match claude.ai). If that cache isn't present it falls back
-// to estimating the window from ~/.claude/projects/**/*.jsonl transcripts.
+// This mirrors the Rubric Console "Sessions" tab (server.py /api/sessions +
+// static/app.js). It is fully standalone: it reconstructs the window directly
+// from ~/.claude/projects/**/*.jsonl transcript timestamps, so it works even
+// when the console server is not running. Source of truth for the algorithm:
+//   Tools/Rubric-console/server.py  (api_sessions)
 //
 // Build:  bash build.sh   ->  SessionWidget.app
-// Run:    open SessionWidget.app   (or use install.sh for start-at-login)
+// Run:    open SessionWidget.app   (or the LaunchAgent for start-at-login)
 
 import Cocoa
 
@@ -29,6 +30,7 @@ extension NSColor {
 // Anthropic / Claude palette
 enum Palette {
     static let ivory    = NSColor.fromHex("#F0EEE6") // card background
+    static let progressGreen = NSColor.fromHex("#4F8F5B") // progress <=50%
     static let clay     = NSColor.fromHex("#CC785C") // primary accent (normal)
     static let nearBlack = NSColor.fromHex("#141413") // primary text
     static let muted    = NSColor.fromHex("#73706B") // secondary text / idle mascot
@@ -58,6 +60,7 @@ struct SessionState {
     var lastActivityMs: Int64?
     var util5h: Double? = nil      // 0…1, authoritative token utilisation (matches claude.ai "% used")
     var util7d: Double? = nil      // 0…1, weekly utilisation
+    var reset7dMs: Int64? = nil
     var source: String = "transcript"   // "api" = authoritative header; "transcript" = local estimate
 }
 
@@ -65,9 +68,9 @@ struct SessionState {
 //
 // session_usage_poll.py (launchd, every 10 min) writes the exact 5h reset and
 // "% used" from Anthropic's rate-limit headers to ~/.claude/session-usage.json.
-// Reading that file means the widget shows the SAME numbers as claude.ai.
-// We fall back to the transcript reconstruction below only when the cache is
-// missing/expired (e.g. before the poller's first run, or if you skip it).
+// Reading that file means the widget shows the SAME numbers as claude.ai and as
+// the Rubric Console. We fall back to the transcript reconstruction below only
+// when the cache is missing/expired (e.g. before the poller's first run).
 enum UsageCache {
     static func url() -> URL {
         FileManager.default.homeDirectoryForCurrentUser
@@ -83,14 +86,16 @@ enum UsageCache {
         let nowMs = Int64(now.timeIntervalSince1970 * 1000)
         let util5 = (obj["util5h"] as? NSNumber)?.doubleValue
         let util7 = (obj["util7d"] as? NSNumber)?.doubleValue
+        let reset7 = (obj["reset7d_ms"] as? NSNumber)?.int64Value
         let src = (obj["source"] as? String) ?? "api"
         if let reset = (obj["reset5h_ms"] as? NSNumber)?.int64Value, reset > nowMs {
             return SessionState(active: true, startMs: reset - Sessions.windowMs, endMs: reset,
-                                lastActivityMs: nil, util5h: util5, util7d: util7, source: src)
+                                lastActivityMs: nil, util5h: util5, util7d: util7,
+                                reset7dMs: reset7, source: src)
         }
         // Reset has passed (or is null): idle, but keep the utilisation figures.
         return SessionState(active: false, startMs: nil, endMs: nil, lastActivityMs: nil,
-                            util5h: util5, util7d: util7, source: src)
+                            util5h: util5, util7d: util7, reset7dMs: reset7, source: src)
     }
 }
 
@@ -282,6 +287,50 @@ final class ClawdView: NSView {
 
 // MARK: - Card view
 
+final class DisclosureButton: NSButton {
+    var expanded = false {
+        didSet { needsDisplay = true }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        isBordered = false
+        setButtonType(.momentaryChange)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let stroke = Palette.nearBlack.withAlphaComponent(isHighlighted ? 0.55 : 0.95)
+        stroke.setStroke()
+
+        let outline = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 3, yRadius: 3)
+        outline.lineWidth = 1.2
+        outline.stroke()
+
+        let chevron = NSBezierPath()
+        let midX = bounds.midX
+        let midY = bounds.midY
+        let half: CGFloat = 4
+        let offset: CGFloat = 2.5
+
+        if expanded {
+            chevron.move(to: NSPoint(x: midX - half, y: midY - 1.5))
+            chevron.line(to: NSPoint(x: midX, y: midY + offset))
+            chevron.line(to: NSPoint(x: midX + half, y: midY - 1.5))
+        } else {
+            chevron.move(to: NSPoint(x: midX - half, y: midY + 1.5))
+            chevron.line(to: NSPoint(x: midX, y: midY - offset))
+            chevron.line(to: NSPoint(x: midX + half, y: midY + 1.5))
+        }
+
+        chevron.lineWidth = 1.8
+        chevron.lineCapStyle = .round
+        chevron.lineJoinStyle = .round
+        chevron.stroke()
+    }
+}
+
 final class CardView: NSView {
     let mascot = ClawdView()
     let title = NSTextField(labelWithString: "Claude session")
@@ -289,6 +338,11 @@ final class CardView: NSView {
     let sub = NSTextField(labelWithString: "")
     let track = NSView()
     let fill = NSView()
+    let weeklyLabel = NSTextField(labelWithString: "Weekly usage")
+    let weeklyTrack = NSView()
+    let weeklyFill = NSView()
+    let disclosure = DisclosureButton(frame: .zero)
+    var onToggleWeekly: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -313,14 +367,34 @@ final class CardView: NSView {
         addSubview(sub)
 
         track.wantsLayer = true
-        track.layer?.cornerRadius = 2
+        track.layer?.cornerRadius = 4
         // Progress track: clay at ~12% alpha for a warm faint tint.
         track.layer?.backgroundColor = Palette.clay.withAlphaComponent(0.12).cgColor
         addSubview(track)
 
         fill.wantsLayer = true
-        fill.layer?.cornerRadius = 2
+        fill.layer?.cornerRadius = 4
         addSubview(fill)
+
+        weeklyLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        weeklyLabel.textColor = Palette.muted
+        weeklyLabel.isHidden = true
+        addSubview(weeklyLabel)
+
+        weeklyTrack.wantsLayer = true
+        weeklyTrack.layer?.cornerRadius = 4
+        weeklyTrack.layer?.backgroundColor = Palette.clay.withAlphaComponent(0.12).cgColor
+        weeklyTrack.isHidden = true
+        addSubview(weeklyTrack)
+
+        weeklyFill.wantsLayer = true
+        weeklyFill.layer?.cornerRadius = 4
+        weeklyFill.isHidden = true
+        addSubview(weeklyFill)
+
+        disclosure.target = self
+        disclosure.action = #selector(toggleWeekly)
+        addSubview(disclosure)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -329,30 +403,86 @@ final class CardView: NSView {
         let pad: CGFloat = 16
         let w = bounds.width, h = bounds.height
         // Right half: large mascot. Left column: title, countdown, sub, progress.
-        mascot.frame = NSRect(x: w - 98, y: 9, width: 90, height: h - 18)
+        mascot.frame = NSRect(x: w - 98, y: h - 107, width: 90, height: 90)
         let colW = w - 122          // left column ends ~8pt before the mascot
         title.frame = NSRect(x: pad, y: h - 24, width: colW, height: 16)
         big.frame   = NSRect(x: pad, y: h - 64, width: colW, height: 38)
-        sub.frame   = NSRect(x: pad, y: 22, width: colW + 6, height: 16)
-        track.frame = NSRect(x: pad, y: 12, width: colW, height: 4)
+        sub.frame   = NSRect(x: pad, y: h - 86, width: colW + 6, height: 16)
+        track.frame = NSRect(x: pad, y: h - 96, width: colW, height: 8)
+        weeklyLabel.frame = NSRect(x: pad, y: 42, width: w - pad * 2, height: 16)
+        weeklyTrack.frame = NSRect(x: pad, y: 32, width: w - pad * 2, height: 8)
+        disclosure.frame = NSRect(x: (w - 17) / 2, y: 5, width: 17, height: 17)
         layoutFill()
+        layoutWeeklyFill()
     }
 
-    var progress: CGFloat = 0 { didSet { layoutFill() } }
+    var progress: CGFloat = 0 {
+        didSet {
+            layoutFill()
+            updateProgressFill()
+        }
+    }
 
-    /// Setting accent recolours the mascot, the countdown text, and the progress fill.
+    var weeklyProgress: CGFloat = 0 {
+        didSet {
+            layoutWeeklyFill()
+            updateWeeklyFill()
+        }
+    }
+
+    var weeklyExpanded = false {
+        didSet {
+            weeklyLabel.isHidden = !weeklyExpanded
+            weeklyTrack.isHidden = !weeklyExpanded
+            weeklyFill.isHidden = !weeklyExpanded
+            disclosure.expanded = weeklyExpanded
+            needsLayout = true
+        }
+    }
+
+    /// Setting accent recolours the mascot and countdown text.
     var accent: NSColor = Palette.clay {
         didSet {
             mascot.tint = accent
-            fill.layer?.backgroundColor = accent.cgColor
             big.textColor = accent
         }
+    }
+
+    @objc private func toggleWeekly() {
+        onToggleWeekly?()
     }
 
     private func layoutFill() {
         let p = max(0, min(1, progress))
         fill.frame = NSRect(x: track.frame.minX, y: track.frame.minY,
                             width: track.frame.width * p, height: track.frame.height)
+    }
+
+    private func layoutWeeklyFill() {
+        let p = max(0, min(1, weeklyProgress))
+        weeklyFill.frame = NSRect(x: weeklyTrack.frame.minX, y: weeklyTrack.frame.minY,
+                                  width: weeklyTrack.frame.width * p,
+                                  height: weeklyTrack.frame.height)
+    }
+
+    private func usageColor(for progress: CGFloat) -> NSColor {
+        let p = max(0, min(1, progress))
+        if p <= 0 {
+            return .clear
+        } else if p <= 0.50 {
+            return Palette.progressGreen
+        } else if p <= 0.80 {
+            return Palette.clay
+        }
+        return Palette.urgentRed
+    }
+
+    private func updateProgressFill() {
+        fill.layer?.backgroundColor = usageColor(for: progress).cgColor
+    }
+
+    private func updateWeeklyFill() {
+        weeklyFill.layer?.backgroundColor = usageColor(for: weeklyProgress).cgColor
     }
 
     // Left-drag moves the window; right-click shows the menu.
@@ -378,11 +508,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var onTop = true
 
     let defaultsKey = "widgetFrame"
+    let weeklyExpandedKey = "weeklyExpanded"
+    let collapsedSize = NSSize(width: 264, height: 124)
+    let expandedSize = NSSize(width: 264, height: 166)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
 
-        let size = NSSize(width: 264, height: 108)
+        let weeklyExpanded = UserDefaults.standard.bool(forKey: weeklyExpandedKey)
+        let size = weeklyExpanded ? expandedSize : collapsedSize
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let origin = NSPoint(x: screen.maxX - size.width - 24, y: screen.maxY - size.height - 24)
 
@@ -396,6 +530,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.level = .floating
 
         card = CardView(frame: NSRect(origin: .zero, size: size))
+        card.weeklyExpanded = weeklyExpanded
+        card.onToggleWeekly = { [weak self] in self?.toggleWeeklyExpanded() }
         window.contentView = card
 
         // Restore saved position only — keep the new size so the layout applies.
@@ -448,6 +584,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func refreshNow() { refreshData(); render() }
     @objc func quit() { NSApp.terminate(nil) }
 
+    func toggleWeeklyExpanded() {
+        setWeeklyExpanded(!card.weeklyExpanded, animate: true)
+    }
+
+    func setWeeklyExpanded(_ expanded: Bool, animate: Bool) {
+        guard card.weeklyExpanded != expanded else { return }
+        card.weeklyExpanded = expanded
+        UserDefaults.standard.set(expanded, forKey: weeklyExpandedKey)
+
+        let targetSize = expanded ? expandedSize : collapsedSize
+        var frame = window.frame
+        frame.origin.y += frame.height - targetSize.height
+        frame.size = targetSize
+        window.setFrame(frame, display: true, animate: animate)
+    }
+
     // Prefer the authoritative cache (matches claude.ai). While the poller
     // hasn't caught up yet — e.g. you just started a session — bridge the gap
     // with the transcript estimate so the widget doesn't read "Idle" mid-use.
@@ -496,9 +648,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             card.mascot.tint = Palette.muted
             fill(card.fill, with: .clear)
         }
+        renderWeeklyUsage()
     }
 
     private func pct(_ v: Double) -> String { "\(Int((v * 100).rounded()))%" }
+
+    private func renderWeeklyUsage() {
+        guard let util = state.util7d else {
+            card.weeklyLabel.stringValue = "Weekly usage unavailable"
+            card.weeklyProgress = 0
+            return
+        }
+        let reset = state.reset7dMs.map { " · resets \(fmtDayClock($0))" } ?? ""
+        card.weeklyLabel.stringValue = "Weekly \(pct(util)) used\(reset)"
+        card.weeklyProgress = CGFloat(max(0, min(1, util)))
+    }
 
     private func fill(_ v: NSView, with c: NSColor) {
         v.layer?.backgroundColor = c.cgColor
@@ -520,6 +684,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func fmtClock(_ ms: Int64) -> String {
         AppDelegate.clock.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
     }
+
+    private static let dayClock: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "EEE HH:mm"
+        return f
+    }()
+
+    func fmtDayClock(_ ms: Int64) -> String {
+        AppDelegate.dayClock.string(from: Date(timeIntervalSince1970: Double(ms) / 1000))
+    }
+}
+
+func writeSnapshot(expanded: Bool, to path: String) {
+    let size = expanded ? NSSize(width: 264, height: 166) : NSSize(width: 264, height: 124)
+    let card = CardView(frame: NSRect(origin: .zero, size: size))
+    card.weeklyExpanded = expanded
+    card.big.stringValue = "1h 23m"
+    card.sub.stringValue = "45% used · resets 22:50"
+    card.progress = 0.45
+    card.accent = Palette.clay
+    card.weeklyLabel.stringValue = "Weekly 32% used · resets Thu 18:00"
+    card.weeklyProgress = 0.32
+    card.layoutSubtreeIfNeeded()
+
+    guard let rep = card.bitmapImageRepForCachingDisplay(in: card.bounds) else { return }
+    card.cacheDisplay(in: card.bounds, to: rep)
+    if let data = rep.representation(using: .png, properties: [:]) {
+        try? data.write(to: URL(fileURLWithPath: path))
+    }
+}
+
+if CommandLine.arguments.contains("--snapshot") {
+    let expanded = CommandLine.arguments.contains("--expanded")
+    let path = CommandLine.arguments.last ?? "/tmp/session-widget-snapshot.png"
+    writeSnapshot(expanded: expanded, to: path)
+    exit(0)
 }
 
 let app = NSApplication.shared
