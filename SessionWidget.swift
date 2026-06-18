@@ -1,11 +1,9 @@
 // SessionWidget — a tiny floating desktop widget that shows the current
 // Claude Code 5-hour usage window and a live "resets in" countdown.
 //
-// This mirrors the Rubric Console "Sessions" tab (server.py /api/sessions +
-// static/app.js). It is fully standalone: it reconstructs the window directly
-// from ~/.claude/projects/**/*.jsonl transcript timestamps, so it works even
-// when the console server is not running. Source of truth for the algorithm:
-//   Tools/Rubric-console/server.py  (api_sessions)
+// Fully standalone: it reconstructs the 5-hour usage window directly
+// from ~/.claude/projects/**/*.jsonl transcript timestamps. No external
+// server or dependency needed — it works straight from transcript data.
 //
 // Build:  bash build.sh   ->  SessionWidget.app
 // Run:    open SessionWidget.app   (or the LaunchAgent for start-at-login)
@@ -69,7 +67,7 @@ struct SessionState {
 // session_usage_poll.py (launchd, every 10 min) writes the exact 5h reset and
 // "% used" from Anthropic's rate-limit headers to ~/.claude/session-usage.json.
 // Reading that file means the widget shows the SAME numbers as claude.ai and as
-// the Rubric Console. We fall back to the transcript reconstruction below only
+// other Claude Code tooling. We fall back to the transcript reconstruction below only
 // when the cache is missing/expired (e.g. before the poller's first run).
 enum UsageCache {
     static func url() -> URL {
