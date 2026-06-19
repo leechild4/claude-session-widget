@@ -158,7 +158,9 @@ def probe_headers(token: str):
         return None
 
 
-def parse_usage(h: dict) -> dict | None:
+def parse_usage(h: dict | None) -> dict | None:
+    if not h:
+        return None
     g = {k.lower(): v for k, v in h.items()}
     reset5h = g.get("anthropic-ratelimit-unified-5h-reset")
     if not reset5h:
