@@ -202,6 +202,9 @@ def write_cache(d: dict):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(d, fh)
     os.replace(tmp, CACHE)
+    # ponytail: heartbeat so a frozen error log isn't mistaken for a dead poller
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ok source={d.get('source')} "
+          f"active={d.get('active')} util5h={d.get('util5h')}", flush=True)
 
 
 # ---------- main ----------
