@@ -123,17 +123,10 @@ def oauth_token() -> str | None:
     except Exception:
         return None
 
-    def find(o):
-        if isinstance(o, dict):
-            for k, v in o.items():
-                if k.lower() in ("accesstoken", "access_token") and isinstance(v, str):
-                    return v
-                r = find(v)
-                if r:
-                    return r
-        return None
-
-    return find(creds)
+    # The keychain item also holds mcpOAuth tokens for MCP servers; a recursive
+    # search for "accessToken" can hit one of those first (401 Invalid bearer token).
+    tok = (creds.get("claudeAiOauth") or {}).get("accessToken")
+    return tok if isinstance(tok, str) else None
 
 
 def probe_headers(token: str):
